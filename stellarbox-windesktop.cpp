@@ -26,6 +26,8 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QSettings>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QDirIterator>
 #include <QMimeData>
 #include <QAbstractProxyModel>
@@ -33,6 +35,9 @@
 #include <QStorageInfo>
 #include <QRegularExpression>
 #include <QTimer>
+#include <QPainterPath>
+#include <QDrag>
+#include <algorithm>
 #include <functional>
 
 #include <cstdio>
@@ -105,6 +110,229 @@ static QList<DesktopView *> &allDesktopViews()
     static QList<DesktopView *> views;
     return views;
 }
+
+// ============================================================================
+//  Tema para el pintado propio (iconos y widgets del escritorio)
+// ============================================================================
+//  El QSS no puede tocar las zonas pintadas con QPainter, así que aquí se
+//  centralizan los colores y radios que usan. Se derivan de la paleta de la
+//  aplicación —que Qt recalcula a partir del QSS activo— de modo que
+//  cualquier hoja de estilo externa se respeta también en el escritorio.
+//  Sin hoja de estilo se conserva el aspecto original.
+//
+//  Un tema puede además afinar el resultado con un bloque JSON dentro del
+//  propio .qss (opcional; los colores admiten #rgb, #rrggbb y #aarrggbb):
+//
+//      /* @stellarbox {
+//           "accent":         "#8fbc5a",
+//           "cpuColor":       "#93ba84",
+//           "memColor":       "#339dd6",
+//           "netColor":       "#66d9e8",
+//           "diskColor":      "#e67e22",
+//           "selectionColor": "#93ba84",
+//           "selectionAlpha": 115,
+//           "hoverColor":     "#ffffff",
+//           "textColor":      "#ffffff",
+//           "panelColor":     "#14181c",
+//           "panelTitleColor":"#bec8d2",
+//           "barBgColor":     "#ffffff",
+//           "iconRadius":      8,
+//           "panelRadius":    14,
+//           "barRadius":       3,
+//           "panelBlur":      14 } */
+//
+//  Tras cambiar qApp->setStyleSheet() hay que llamar a Theme::invalidate().
+struct Theme
+{
+    QColor selection;        // icono seleccionado (fondo translúcido)
+    QColor current;          // icono con el foco
+    QColor hover;            // icono bajo el cursor
+    QColor iconText;         // nombre del icono
+    QColor rubberPen;        // selección por rectángulo (trazo)
+    QColor rubberFill;       // selección por rectángulo (relleno)
+    QColor panel;            // fondo de los widgets del escritorio
+    QColor panelTitle;       // título del widget (y texto secundario)
+    QColor panelText;        // texto principal de los widgets
+    QColor barBg;            // fondo de las barras de progreso
+    QColor cpuColor;         // barra de CPU
+    QColor memColor;         // barra de memoria
+    QColor netColor;         // texto de "Bajada"
+    QColor diskColor;        // barra de discos
+    int iconRadius  = 8;     // redondeo de la celda de un icono
+    int panelRadius = 10;    // redondeo del panel de widgets
+    int barRadius   = 3;     // redondeo de las barras de progreso
+    int panelBlur   = 14;    // desenfoque del cristal (0 = panel sin cristal)
+    bool panelFromTheme = false;   // panelColor lo fijó el bloque @stellarbox
+
+    static const Theme &get()
+    {
+        if (!valid()) {
+            instance().load();
+            valid() = true;
+        }
+        return instance();
+    }
+
+    // Marca el tema como obsoleto: se recalculará en el próximo get()
+    static void invalidate() { valid() = false; }
+
+private:
+    static Theme &instance() { static Theme t; return t; }
+    static bool  &valid()    { static bool v = false; return v; }
+
+    // Primer valor de color de una propiedad QSS (p. ej. "selection-background-color")
+    static QColor firstColorValue(const QString &qss, const QString &property)
+    {
+        int i = qss.indexOf(property);
+        if (i < 0)
+            return QColor();
+        i = qss.indexOf(QLatin1Char(':'), i + property.size());
+        if (i < 0)
+            return QColor();
+        int end = qss.indexOf(QLatin1Char(';'), i);
+        if (end < 0)
+            end = qss.size();
+        QString v = qss.mid(i + 1, end - i - 1).trimmed();
+        if (!v.isEmpty()
+            && (v.front() == QLatin1Char('"') || v.front() == QLatin1Char('\'')))
+            v = v.mid(1, v.size() - 2);   // quita comillas
+        const QColor c(v.trimmed());
+        return c.isValid() ? c : QColor();
+    }
+
+    void load()
+    {
+        // Aspecto original (pensado sobre fondo oscuro) por defecto
+        panelFromTheme = false;
+        selection   = QColor(147, 186, 132, 115);
+        current     = QColor(255, 255, 255, 40);
+        hover       = QColor(255, 255, 255, 31);
+        iconText    = QColor(255, 255, 255);
+        rubberPen   = QColor(255, 255, 255, 210);
+        rubberFill  = QColor(255, 255, 255, 24);
+        panel       = QColor(20, 24, 28, 190);
+        panelTitle  = QColor(190, 200, 210);
+        panelText   = QColor(255, 255, 255);
+        barBg       = QColor(255, 255, 255, 45);
+        cpuColor    = QColor(0x93, 0xba, 0x84);
+        memColor    = QColor(0x33, 0x9d, 0xd6);
+        netColor    = QColor(0x66, 0xd9, 0xe8);
+        diskColor   = QColor(0xe6, 0x7e, 0x22);
+
+        // Con un QSS activo se toman del tema el acento (Highlight es uno de
+        // los pocos roles que el QSS sí traslada a la paleta) y, si el tema
+        // redefine también los colores base (reglas `*`), esos también.
+        // Si no, se conservan los del aspecto original: están pensados para
+        // verse sobre el fondo de escritorio y encajan con cualquier tema.
+        if (!qApp->styleSheet().isEmpty()) {
+            const QPalette pal = qApp->palette();
+            const QPalette sys;   // paleta por defecto del sistema
+            const QColor win  = pal.color(QPalette::Window);
+            const QColor text = pal.color(QPalette::WindowText);
+
+            const QColor acc = pal.color(QPalette::Highlight);
+            // Si el tema declara su color de selección en el QSS, es más
+            // fiel que el rol Highlight de la paleta (que sin reglas `*`
+            // se queda en el del sistema)
+            const QColor qssSel = firstColorValue(qApp->styleSheet(),
+                                                  QStringLiteral("selection-background-color"));
+            selection = qssSel.isValid() ? qssSel : acc;
+            selection.setAlpha(115);
+
+            if (win != sys.color(QPalette::Window)
+                || text != sys.color(QPalette::WindowText)) {
+                // El tema define sus propios colores base (p. ej. un tema
+                // claro con reglas `*`): se respetan también aquí
+                current    = text; current.setAlpha(40);
+                hover      = text; hover.setAlpha(31);
+                iconText   = text;
+                rubberPen  = text; rubberPen.setAlpha(210);
+                rubberFill = text; rubberFill.setAlpha(24);
+                panel      = win;  panel.setAlpha(190);
+                panelTitle = pal.color(QPalette::PlaceholderText);
+                panelText  = text;
+                barBg      = text; barBg.setAlpha(45);
+            }
+        }
+
+        applyJsonOptions(qApp->styleSheet());
+    }
+
+    // Opciones del bloque /* @stellarbox { ... } */ del .qss, si existe
+    void applyJsonOptions(const QString &qss)
+    {
+        const int at = qss.indexOf(QLatin1String("@stellarbox"));
+        if (at < 0)
+            return;
+        const int open = qss.indexOf(QLatin1Char('{'), at);
+        if (open < 0)
+            return;
+
+        // Localiza la llave de cierre emparejada (saltando cadenas JSON)
+        int depth = 0;
+        bool inString = false;
+        int close = -1;
+        for (int i = open; i < qss.size(); ++i) {
+            const QChar c = qss.at(i);
+            if (inString) {
+                if (c == QLatin1Char('"') && qss.at(i - 1) != QLatin1Char('\\'))
+                    inString = false;
+            } else if (c == QLatin1Char('"')) {
+                inString = true;
+            } else if (c == QLatin1Char('{')) {
+                ++depth;
+            } else if (c == QLatin1Char('}') && --depth == 0) {
+                close = i;
+                break;
+            }
+        }
+        if (close < 0)
+            return;
+
+        const QJsonObject o = QJsonDocument::fromJson(
+            qss.mid(open, close - open + 1).toUtf8()).object();
+        if (o.isEmpty())
+            return;
+
+        const auto takeColor = [&o](const char *key) {
+            const QColor c(o.value(QLatin1String(key)).toString());
+            return c.isValid() ? c : QColor();
+        };
+        const auto takeInt = [&o](const char *key, int fallback) {
+            const QJsonValue v = o.value(QLatin1String(key));
+            return v.isDouble() ? v.toInt() : fallback;
+        };
+
+        // "accent" cambia de un golpe los cuatro acentos y la selección
+        const QColor accent = takeColor("accent");
+        if (accent.isValid())
+            cpuColor = memColor = netColor = diskColor = accent;
+
+        // selectionColor se respeta; para la selección se usa translucidez
+        // salvo que el color ya la traiga (#aarrggbb) o se fije selectionAlpha
+        if (const QColor c = takeColor("selectionColor"); c.isValid()) selection  = c;
+        else if (accent.isValid())                                     selection  = accent;
+        if (const QColor c = takeColor("hoverColor");      c.isValid()) hover      = c;
+        if (const QColor c = takeColor("textColor");       c.isValid()) iconText = panelText = c;
+        if (const QColor c = takeColor("panelColor");      c.isValid()) { panel = c; panelFromTheme = true; }
+        if (const QColor c = takeColor("panelTitleColor"); c.isValid()) panelTitle = c;
+        if (const QColor c = takeColor("barBgColor");      c.isValid()) barBg      = c;
+        if (const QColor c = takeColor("cpuColor");        c.isValid()) cpuColor   = c;
+        if (const QColor c = takeColor("memColor");        c.isValid()) memColor   = c;
+        if (const QColor c = takeColor("netColor");        c.isValid()) netColor   = c;
+        if (const QColor c = takeColor("diskColor");       c.isValid()) diskColor  = c;
+
+        if (const QJsonValue v = o.value(QLatin1String("selectionAlpha")); v.isDouble())
+            selection.setAlpha(qBound(0, v.toInt(), 255));
+        else if (selection.alpha() == 255)
+            selection.setAlpha(115);   // overlay: no debe tapar el fondo
+
+        iconRadius  = takeInt("iconRadius",  iconRadius);
+        panelRadius = takeInt("panelRadius", panelRadius);
+        barRadius   = takeInt("barRadius",   barRadius);
+        panelBlur   = takeInt("panelBlur",   panelBlur);
+    }
+};
 
 // ============================================================================
 //  Tema de iconos predeterminado del sistema
@@ -624,6 +852,28 @@ public:
     void emptyTrashNow();                              // "Vaciar la Papelera"
     ~DesktopView() override;                           // deja el registro de vistas
 
+    // Recorte del fondo de pantalla (en coordenadas de la vista) difuminado:
+    // el "cristal esmerilado" que dibujan los widgets del escritorio. Se
+    // genera una vez por radio de desenfoque y se guarda en caché; el caché
+    // se invalida solo al cambiar el fondo (loadWallpaper).
+    QPixmap wallpaperGlass(const QRect &viewRect, int radius)
+    {
+        if (radius <= 0 || m_wallpaper.isNull() || viewRect.isEmpty())
+            return QPixmap();
+        if (m_glass.isNull() || m_glassRadius != radius) {
+            m_glassRadius = radius;
+            m_glass = blurredHalf(m_wallpaper, radius);
+        }
+        if (m_glass.isNull())
+            return QPixmap();
+        // El caché está a media resolución: recortar y escalar al tamaño real
+        const QRect src(viewRect.x() / 2, viewRect.y() / 2,
+                        qMax(1, viewRect.width() / 2),
+                        qMax(1, viewRect.height() / 2));
+        return m_glass.copy(src).scaled(viewRect.size(), Qt::IgnoreAspectRatio,
+                                        Qt::FastTransformation);
+    }
+
 public slots:
     // 0xc0d0 — abre el elemento seleccionado con la app por defecto (los
     // iconos del sistema abren su destino: raíz, casa, red o papelera)
@@ -737,6 +987,7 @@ private:
     void ensureWidgets();                // crea los widgets del escritorio (ocultos)
     void relayoutWidgets();              // recoloca los widgets visibles
     QList<QAction *> systemIconMenuActions(QMenu &menu, int iconId) const;
+    void sortIcons(int criterion, bool descending);   // "Ordenar los iconos"
 
     // 0xdf60 — carga el fondo actual (guardado → instalado → gradiente)
     void loadWallpaper()
@@ -773,6 +1024,7 @@ private:
         m_wallpaper = pix.scaled(
             QGuiApplication::primaryScreen()->geometry().size(),
             Qt::IgnoreAspectRatio, Qt::SmoothTransformation);  // 0xe867
+        m_glass = QPixmap();      // el fondo ha cambiado: cristal a recalcular
         update();
     }
 
@@ -791,11 +1043,48 @@ private:
         return pix;
     }
 
+    // Desenfoque gaussiano por software (sin necesidad de compositor): se
+    // trabaja a media resolución (el desenfoque es de baja frecuencia) y se
+    // cubren los bordes repitiendo el propio fondo, para que QGraphicsBlur
+    // no los deje transparentes.
+    static QPixmap blurredHalf(const QPixmap &src, int radius)
+    {
+        const QPixmap half = src.scaled(src.size() / 2, Qt::IgnoreAspectRatio,
+                                        Qt::SmoothTransformation);
+        const int m = qMin(radius, 32);
+        QPixmap tiled(half.size() + QSize(2 * m, 2 * m));
+        tiled.fill(Qt::transparent);
+        {
+            QPainter p(&tiled);
+            for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                    p.drawPixmap(m + dx * half.width(), m + dy * half.height(), half);
+        }
+        QGraphicsScene scene;
+        QGraphicsPixmapItem *item = scene.addPixmap(tiled);
+        auto *blur = new QGraphicsBlurEffect;   // la escena toma posesión
+        blur->setBlurRadius(radius);
+        blur->setBlurHints(QGraphicsBlurEffect::PerformanceHint);
+        item->setGraphicsEffect(blur);
+        QPixmap out(tiled.size());
+        out.fill(Qt::transparent);
+        {
+            QPainter p(&out);
+            scene.render(&p, QRectF(out.rect()), QRectF(tiled.rect()));
+        }
+        return out.copy(QRect(m, m, half.width(), half.height()));
+    }
+
     QString m_desktopDir;      /* +0x28 */
     QString m_wallpaperFile;   /* +0x40 */
     QString m_bgDir;           /* +0x58 */
 
     QPixmap m_wallpaper;       /* +0x70 */
+
+    // Caché del fondo difuminado (cristal de los widgets); se regenera en
+    // wallpaperGlass() si cambia el radio o loadWallpaper() lo vacía
+    QPixmap m_glass;
+    int     m_glassRadius = -1;
 
     QFileSystemModel *m_model = nullptr;   /* +0x88 */
     DesktopIconView *m_list   = nullptr;   /* +0x90 */
@@ -899,11 +1188,39 @@ public:
         settings.endGroup();
     }
 
+    // Recoloca TODOS los iconos en la rejilla siguiendo `rowOrder` (filas del
+    // modelo en el orden deseado): la primera ocupa la esquina superior
+    // izquierda y las siguientes bajan por la columna, pasando a la siguiente
+    // al llenarse. El resultado se guarda como posiciones explícitas, así que
+    // se mantiene entre sesiones. Lo usa "Ordenar los iconos" del menú.
+    void arrangeIcons(const QVector<int> &rowOrder)
+    {
+        if (!model())
+            return;
+        const QSize grid = m_gridSize.isValid() ? m_gridSize : QSize(112, 96);
+        const int viewH = viewport() ? viewport()->height() : height();
+        const int perCol = qMax(1, (viewH - 2 * m_margin) / qMax(1, grid.height()));
+
+        m_savedPositions.clear();
+        for (int i = 0; i < rowOrder.size(); ++i) {
+            const QString key = identityKey(rowOrder.at(i));
+            if (key.isEmpty())
+                continue;
+            const int col    = i / perCol;
+            const int within = i % perCol;
+            m_savedPositions[key] = QPoint(m_margin + col * grid.width(),
+                                           m_margin + within * grid.height());
+        }
+        savePositions();      // persiste la disposición calculada
+        viewport()->update();
+    }
+
 #ifdef STELLARBOX_SNAPSHOT_TEST
     // Simula el soltado interno de un arrastre (diagnóstico sin pantalla)
     void debugSimulateInternalDrop(const QModelIndexList &indexes,
                                    const QPoint &dropPos)
     {
+        m_pressOffset = QPoint();   // sin agarre real: cae en el punto soltado
         applyInternalDrop(indexes, dropPos);
     }
 
@@ -1054,6 +1371,54 @@ protected:
     int horizontalOffset() const override { return 0; }
 
     // --- pintado -----------------------------------------------------------
+    // Dibuja la celda de la fila `row` (resaltado + icono + nombre) sobre `p`.
+    // Se usa tanto en el escritorio como para la miniatura del arrastre.
+    void paintIcon(QPainter &p, const Theme &theme, int row) const
+    {
+        const QModelIndex idx = model()->index(row, 0, rootIndex());
+        if (!idx.isValid())
+            return;
+        const QRect cell = iconRect(row);
+        const bool selected = selectionModel() && selectionModel()->isSelected(idx);
+        const bool current  = selectionModel() && idx == currentIndex();
+        const bool hover    = idx == m_hoverIndex;
+
+        if (selected || current || hover) {
+            const QColor bg = selected ? theme.selection
+                              : current ? theme.current
+                                        : theme.hover;
+            p.setPen(Qt::NoPen);
+            p.setBrush(bg);
+            p.drawRoundedRect(cell.adjusted(0, 0, -1, -1),
+                              theme.iconRadius, theme.iconRadius);
+        }
+
+        const QIcon icon = qvariant_cast<QIcon>(idx.data(Qt::DecorationRole));
+        if (!icon.isNull()) {
+            const QRect iconArea(
+                cell.center().x() - m_iconSize.width() / 2,
+                cell.y() + 6,
+                m_iconSize.width(), m_iconSize.height());
+            icon.paint(&p, iconArea, Qt::AlignCenter, QIcon::Normal, QIcon::Off);
+        }
+
+        const QString text = idx.data(Qt::DisplayRole).toString();
+        if (!text.isEmpty()) {
+            const QRect textArea = cell.adjusted(3, m_iconSize.height() + 8, -3, -2);
+            QFont f = p.font();
+            f.setPixelSize(12);
+            f.setWeight(QFont::Normal);
+            p.setFont(f);
+            p.setPen(theme.iconText);
+            const QFontMetrics fm(f);
+            QString shown = text;
+            if (fm.horizontalAdvance(shown) > textArea.width() * 2)
+                shown = fm.elidedText(shown, Qt::ElideMiddle, textArea.width() * 2);
+            p.drawText(textArea, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
+                       shown);
+        }
+    }
+
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(viewport());
@@ -1061,59 +1426,15 @@ protected:
 
         if (!model())
             return;
+        const Theme &theme = Theme::get();
         const int rows = model()->rowCount(rootIndex());
-        for (int r = 0; r < rows; ++r) {
-            const QModelIndex idx = model()->index(r, 0, rootIndex());
-            if (!idx.isValid())
-                continue;
-            const QRect cell = iconRect(r);
-            const bool selected = selectionModel() && selectionModel()->isSelected(idx);
-            const bool current  = selectionModel() && idx == currentIndex();
-            const bool hover    = idx == m_hoverIndex;
-
-            if (selected || current || hover) {
-                QColor bg;
-                if (selected)
-                    bg = QColor(147, 186, 132, 115);
-                else if (current)
-                    bg = QColor(255, 255, 255, 40);
-                else
-                    bg = QColor(255, 255, 255, 31);
-                p.setPen(Qt::NoPen);
-                p.setBrush(bg);
-                p.drawRoundedRect(cell.adjusted(0, 0, -1, -1), 8, 8);
-            }
-
-            const QIcon icon = qvariant_cast<QIcon>(idx.data(Qt::DecorationRole));
-            if (!icon.isNull()) {
-                const QRect iconArea(
-                    cell.center().x() - m_iconSize.width() / 2,
-                    cell.y() + 6,
-                    m_iconSize.width(), m_iconSize.height());
-                icon.paint(&p, iconArea, Qt::AlignCenter, QIcon::Normal, QIcon::Off);
-            }
-
-            const QString text = idx.data(Qt::DisplayRole).toString();
-            if (!text.isEmpty()) {
-                const QRect textArea = cell.adjusted(3, m_iconSize.height() + 8, -3, -2);
-                QFont f = p.font();
-                f.setPixelSize(12);
-                f.setWeight(QFont::Normal);
-                p.setFont(f);
-                p.setPen(QColor(255, 255, 255));
-                const QFontMetrics fm(f);
-                QString shown = text;
-                if (fm.horizontalAdvance(shown) > textArea.width() * 2)
-                    shown = fm.elidedText(shown, Qt::ElideMiddle, textArea.width() * 2);
-                p.drawText(textArea, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
-                           shown);
-            }
-        }
+        for (int r = 0; r < rows; ++r)
+            paintIcon(p, theme, r);
 
         // recuadro de selección por rectángulo
         if (!m_rubberBand.isNull()) {
-            p.setPen(QPen(QColor(255, 255, 255, 210), 1, Qt::DashLine));
-            p.setBrush(QColor(255, 255, 255, 24));
+            p.setPen(QPen(theme.rubberPen, 1, Qt::DashLine));
+            p.setBrush(theme.rubberFill);
             p.drawRect(m_rubberBand);
         }
     }
@@ -1136,6 +1457,10 @@ protected:
         m_pressIndex = idx;
         m_dragging   = false;
         m_rubberBand = QRect();
+        // punto agarrado dentro de la celda: al soltar se respeta para que el
+        // icono quede justo donde está el puntero (no en la esquina de la celda)
+        m_pressOffset = idx.isValid() ? (m_pressPos - iconRect(idx.row()).topLeft())
+                                      : QPoint();
 
         if (event->button() != Qt::LeftButton || !selectionModel())
             return;
@@ -1243,12 +1568,55 @@ protected:
         QAbstractItemView::mouseDoubleClickEvent(event);
     }
 
-    // Registra la selección arrastrada para recolocarla al soltar
+    // Inicia el arrastre con una miniatura propia de los iconos seleccionados.
+    // La clase base coloca el "fantasma" con QAbstractItemViewPrivate::
+    // pressedPosition; como aquí el ratón se gestiona a mano (no se llama al
+    // mousePressEvent de la base) esa posición nunca se rellena y el fantasma
+    // aparecía desplazado del puntero. Se construye el QDrag a mano, con el
+    // punto agarrado correcto, y se recuerda la selección para el soltado.
     void startDrag(Qt::DropActions supportedActions) override
     {
-        m_dragIndexes = selectionModel() ? selectionModel()->selectedIndexes()
-                                         : QModelIndexList();
-        QAbstractItemView::startDrag(supportedActions);
+        if (!model() || !selectionModel())
+            return;
+        QModelIndexList indexes = selectionModel()->selectedIndexes();
+        if (indexes.isEmpty())
+            return;
+        // orden estable por fila: al soltar varios se apilan en ese orden
+        std::sort(indexes.begin(), indexes.end(),
+                  [](const QModelIndex &a, const QModelIndex &b) {
+                      return a.row() < b.row();
+                  });
+
+        // miniatura real de los iconos seleccionados, pintada con el mismo
+        // código que el escritorio
+        QRect rect;
+        for (const QModelIndex &idx : indexes)
+            rect |= visualRect(idx);
+        if (rect.isEmpty())
+            return;
+
+        QPixmap pixmap(rect.size());
+        pixmap.fill(Qt::transparent);
+        {
+            QPainter p(&pixmap);
+            p.setRenderHint(QPainter::Antialiasing, true);
+            p.translate(-rect.topLeft());
+            const Theme &theme = Theme::get();
+            for (const QModelIndex &idx : indexes)
+                paintIcon(p, theme, idx.row());
+        }
+
+        QMimeData *data = model()->mimeData(indexes);
+        if (!data)
+            return;
+
+        m_dragIndexes = indexes;
+        auto *drag = new QDrag(this);
+        drag->setMimeData(data);
+        drag->setPixmap(pixmap);
+        // el punto agarrado del icono queda exactamente bajo el puntero
+        drag->setHotSpot(m_pressPos - rect.topLeft());
+        drag->exec(supportedActions, Qt::MoveAction);
         m_dragIndexes.clear();
     }
 
@@ -1319,14 +1687,18 @@ private:
         settings.endGroup();
     }
 
-    // Recoloca los iconos arrastrados a partir de la celda de destino y
-    // guarda inmediatamente la configuración resultante
+    // Recoloca los iconos arrastrados y guarda inmediatamente la configuración
+    // resultante. El icono aterriza justo donde estaba respecto al puntero
+    // (m_pressOffset es el punto agarrado dentro de la celda), sin saltar a la
+    // rejilla, para que quede exactamente bajo el cursor; iconRect ya lo
+    // mantiene dentro del área útil. Los demás elegidos se apilan debajo.
     void applyInternalDrop(const QModelIndexList &indexes, const QPoint &dropPos)
     {
         if (indexes.isEmpty())
             return;
-        const int x = snap(dropPos.x(), m_gridSize.width());
-        int y = snap(dropPos.y(), m_gridSize.height());
+        const QPoint anchor = dropPos - m_pressOffset;
+        int x = anchor.x();
+        int y = anchor.y();
         for (const QModelIndex &idx : indexes) {
             if (!idx.isValid() || !model() || idx.model() != model())
                 continue;
@@ -1335,14 +1707,6 @@ private:
         }
         savePositions();
         viewport()->update();
-    }
-
-    // Ajusta una coordenada a la rejilla de celdas (anclada al margen)
-    int snap(int value, int cell) const
-    {
-        return qMax(0, cell > 0
-            ? qRound(double(value - m_margin) / cell) * cell + m_margin
-            : value);
     }
 
     // Nombre de la pantalla: cada monitor guarda sus posiciones por separado
@@ -1364,6 +1728,7 @@ private:
     QModelIndex m_hoverIndex;                            // fila bajo el cursor
     QModelIndex m_pressIndex;                            // fila pulsada (arrastre)
     QPoint m_pressPos;
+    QPoint m_pressOffset;                                // punto agarrado dentro de la celda
     bool m_dragging = false;                             // arrastre en curso
     QRect m_rubberBand;                                  // selección por rectángulo
 };
@@ -1473,6 +1838,92 @@ QStringList DesktopView::debugSystemMenuLabels(int iconId) const
 }
 #endif
 
+// Recoloca los iconos del escritorio con un criterio de ordenación:
+//   0 nombre · 1 tamaño · 2 tipo · 3 fecha de modificación
+// Los iconos del sistema (Equipo, Usuario, Red, Papelera) quedan siempre
+// primero, en su orden fijo (como en un escritorio real); los archivos se
+// ordenan por el criterio elegido, con las carpetas delante de los archivos.
+// El resultado se guarda como posiciones, así que sobrevive al reinicio.
+void DesktopView::sortIcons(int criterion, bool descending)
+{
+    if (!m_proxy || !m_list)
+        return;
+
+    const int total = m_proxy->rowCount();
+    const int systemRows = m_proxy->systemIconCount();
+
+    QVector<int> order;
+    order.reserve(total);
+    for (int r = 0; r < systemRows; ++r)   // iconos del sistema, siempre primero
+        order << r;
+
+    QVector<int> files;
+    files.reserve(qMax(0, total - systemRows));
+    for (int r = systemRows; r < total; ++r)
+        files << r;
+
+    const auto sourceIndex = [this](int row) {
+        return m_proxy->mapToSource(m_proxy->index(row, 0));
+    };
+    const auto fileName = [this](int row) {
+        return m_proxy->data(m_proxy->index(row, 0), Qt::DisplayRole).toString();
+    };
+
+    // Compara dos filas de archivo por el criterio elegido (siempre
+    // ascendente); el orden de las carpetas se decide fuera (van siempre
+    // primero, también en orden inverso).
+    const auto compare = [&](int a, int b) -> int {
+        const QModelIndex sa = sourceIndex(a);
+        const QModelIndex sb = sourceIndex(b);
+        if (!sa.isValid() || !sb.isValid())
+            return sa.isValid() ? -1 : (sb.isValid() ? 1 : 0);
+
+        switch (criterion) {
+        case 1: {   // tamaño
+            const qint64 va = m_model->size(sa);
+            const qint64 vb = m_model->size(sb);
+            if (va != vb)
+                return va < vb ? -1 : 1;
+            break;
+        }
+        case 2: {   // tipo
+            const int c = QString::compare(m_model->type(sa), m_model->type(sb),
+                                           Qt::CaseInsensitive);
+            if (c)
+                return c;
+            break;
+        }
+        case 3: {   // fecha de modificación
+            const QDateTime ta = m_model->lastModified(sa);
+            const QDateTime tb = m_model->lastModified(sb);
+            if (ta != tb)
+                return ta < tb ? -1 : 1;
+            break;
+        }
+        default:    // nombre
+            break;
+        }
+        return QString::localeAwareCompare(fileName(a), fileName(b));
+    };
+
+    const auto isDir = [&](int row) {
+        const QModelIndex src = sourceIndex(row);
+        return src.isValid() && m_model->isDir(src);
+    };
+
+    std::stable_sort(files.begin(), files.end(), [&](int a, int b) {
+        const bool da = isDir(a);
+        const bool db = isDir(b);
+        if (da != db)
+            return da;                 // carpetas primero (siempre)
+        const int c = compare(a, b);
+        return descending ? c > 0 : c < 0;
+    });
+
+    order += files;
+    m_list->arrangeIcons(order);
+}
+
 // 0xf050 — menú contextual de la lista (definido aquí, con DesktopIconView completo)
 void DesktopView::showContextMenu(const QPoint &pos)
 {
@@ -1538,6 +1989,38 @@ void DesktopView::showContextMenu(const QPoint &pos)
         QAction *paste     = menu.addAction(QStringLiteral("Pegar"));
         paste->setEnabled(QGuiApplication::clipboard()->mimeData()
                           && QGuiApplication::clipboard()->mimeData()->hasUrls());
+
+        // --- Ordenar los iconos (submenú) ----------------------------
+        // El criterio elegido se recuerda en settings.ini; al elegir uno, los
+        // iconos se recolocan en la rejilla en ese orden.
+        const QSettings sortSettings(configFilePath(), QSettings::IniFormat);
+        const int  curSortKey  = sortSettings.value(
+            QStringLiteral("Appearance/IconSortKey"), 0).toInt();
+        const bool curSortDesc = sortSettings.value(
+            QStringLiteral("Appearance/IconSortDescending"), false).toBool();
+
+        menu.addSeparator();
+        QMenu *sortMenu = menu.addMenu(QStringLiteral("Ordenar los iconos"));
+        auto *sortGroup = new QActionGroup(sortMenu);
+        QHash<QAction *, int> sortKeyOf;
+        const QVector<QPair<int, QString>> sortItems = {
+            { 0, QStringLiteral("Nombre") },
+            { 1, QStringLiteral("Tamaño") },
+            { 2, QStringLiteral("Tipo") },
+            { 3, QStringLiteral("Fecha de modificación") },
+        };
+        for (const QPair<int, QString> &item : sortItems) {
+            QAction *a = sortMenu->addAction(item.second);
+            a->setCheckable(true);
+            a->setChecked(curSortKey == item.first);
+            sortGroup->addAction(a);
+            sortKeyOf.insert(a, item.first);
+        }
+        sortMenu->addSeparator();
+        QAction *sortDesc = sortMenu->addAction(QStringLiteral("Orden inverso"));
+        sortDesc->setCheckable(true);
+        sortDesc->setChecked(curSortDesc);
+
         menu.addSeparator();
         QAction *manage = menu.addAction(QStringLiteral("Abrir con gestor de archivos"));
         menu.addSeparator();
@@ -1547,7 +2030,19 @@ void DesktopView::showContextMenu(const QPoint &pos)
         QAction *config = menu.addAction(QStringLiteral("Configuración..."));
 
         QAction *chosen = menu.exec(m_list->viewport()->mapToGlobal(pos));
-        if (chosen == create)
+        if (sortKeyOf.contains(chosen)) {
+            const int key = sortKeyOf.value(chosen);
+            sortIcons(key, curSortDesc);
+            QSettings s(configFilePath(), QSettings::IniFormat);
+            s.setValue(QStringLiteral("Appearance/IconSortKey"), key);
+            s.setValue(QStringLiteral("Appearance/IconSortDescending"), curSortDesc);
+        } else if (chosen == sortDesc) {
+            const bool desc = sortDesc->isChecked();
+            sortIcons(curSortKey, desc);
+            QSettings s(configFilePath(), QSettings::IniFormat);
+            s.setValue(QStringLiteral("Appearance/IconSortKey"), curSortKey);
+            s.setValue(QStringLiteral("Appearance/IconSortDescending"), desc);
+        } else if (chosen == create)
             newFolder();
         else if (chosen == document)
             newDocument();
@@ -2011,14 +2506,41 @@ protected:
     {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
+        const Theme &theme = Theme::get();
 
-        // panel translúcido redondeado
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(20, 24, 28, 190));
-        p.drawRoundedRect(rect(), 10, 10);
+        // Cristal esmerilado: la parte del escritorio que queda detrás del
+        // widget, difuminada (se pinta aquí mismo, sin necesitar compositor)
+        // y, encima, el tinte redondeado del tema. Si no hay cristal
+        // (panelBlur = 0 o sin fondo) se pinta el panel directamente.
+        QPixmap glass;
+        if (theme.panelBlur > 0) {
+            if (auto *view = qobject_cast<DesktopView *>(parentWidget()))
+                glass = view->wallpaperGlass(QRect(mapTo(view, QPoint(0, 0)),
+                                                   size()), theme.panelBlur);
+        }
+        if (!glass.isNull()) {
+            QPainterPath shape;
+            shape.addRoundedRect(QRectF(rect()), theme.panelRadius,
+                                 theme.panelRadius);
+            p.fillPath(shape, QBrush(glass));
+            QColor tint = theme.panel;
+            // Con el color por defecto se limita el tinte para que el
+            // desenfoque se note; si el tema fija panelColor se respeta su
+            // alfa tal cual (y "panelBlur": 0 desactiva el cristal)
+            if (!theme.panelFromTheme)
+                tint.setAlpha(qMin(tint.alpha(), 140));
+            p.setPen(Qt::NoPen);
+            p.setBrush(tint);
+            p.drawRoundedRect(rect(), theme.panelRadius, theme.panelRadius);
+        } else {
+            // panel translúcido redondeado
+            p.setPen(Qt::NoPen);
+            p.setBrush(theme.panel);
+            p.drawRoundedRect(rect(), theme.panelRadius, theme.panelRadius);
+        }
 
         // título
-        p.setPen(QColor(190, 200, 210));
+        p.setPen(theme.panelTitle);
         QFont f = p.font();
         f.setPixelSize(11);
         f.setWeight(QFont::DemiBold);
@@ -2038,18 +2560,19 @@ protected:
     void drawBar(QPainter &p, const QRect &barRect, double ratio,
                  const QColor &fill) const
     {
+        const Theme &theme = Theme::get();
         QRect bar = barRect.adjusted(0, (barRect.height() - 6) / 2, 0,
                                      -(barRect.height() - 6) / 2);
         p.setPen(Qt::NoPen);
-        p.setBrush(QColor(255, 255, 255, 45));
-        p.drawRoundedRect(bar, 3, 3);
+        p.setBrush(theme.barBg);
+        p.drawRoundedRect(bar, theme.barRadius, theme.barRadius);
         const int w = qRound(bar.width() * qBound(0.0, ratio, 1.0));
         if (w <= 0)
             return;
         QRect fillRect = bar.adjusted(0, 0, 0, 0);
         fillRect.setWidth(w);
         p.setBrush(fill);
-        p.drawRoundedRect(fillRect, 3, 3);
+        p.drawRoundedRect(fillRect, theme.barRadius, theme.barRadius);
     }
 };
 
@@ -2079,7 +2602,7 @@ private:
         f.setWeight(QFont::Bold);
         f.setFamily(QStringLiteral("monospace"));
         p.setFont(f);
-        p.setPen(QColor(255, 255, 255));
+        p.setPen(Theme::get().panelText);
         p.drawText(r.adjusted(0, -4, 0, -22), Qt::AlignHCenter,
                    now.toString(QStringLiteral("HH:mm:ss")));
 
@@ -2087,7 +2610,7 @@ private:
         f.setWeight(QFont::Normal);
         f.setFamily(QString());
         p.setFont(f);
-        p.setPen(QColor(210, 220, 230));
+        p.setPen(Theme::get().panelTitle);
         static const QLocale spanish(QLocale::Spanish);
         p.drawText(r.adjusted(0, 26, 0, 0), Qt::AlignHCenter,
                    spanish.toString(now, QStringLiteral("dddd d 'de' MMMM yyyy")));
@@ -2151,8 +2674,11 @@ private:
             return;
         quint64 total = 0;
         quint64 avail = 0;
-        while (!f.atEnd()) {
-            const QList<QByteArray> parts = f.readLine().simplified().split(' ');
+        // Nota: los ficheros de /proc tienen tamaño 0, así que no se puede
+        // usar atEnd(); se lee todo de una vez.
+        const QList<QByteArray> lines = f.readAll().split('\n');
+        for (const QByteArray &line : lines) {
+            const QList<QByteArray> parts = line.simplified().split(' ');
             if (parts.size() < 2)
                 continue;
             if (parts[0] == "MemTotal:")          total = parts[1].toULongLong();
@@ -2164,14 +2690,15 @@ private:
 
     void paintContent(QPainter &p, const QRect &r) const override
     {
-        p.setPen(QColor(255, 255, 255));
+        const Theme &theme = Theme::get();
+        p.setPen(theme.panelText);
         p.drawText(r.left(), r.top() + 12,
                    QStringLiteral("CPU: %1 %").arg(qRound(m_cpu * 100)));
-        drawBar(p, r.adjusted(0, 16, 0, 16), m_cpu, QColor(0x93, 0xba, 0x84));
+        drawBar(p, r.adjusted(0, 16, 0, 16), m_cpu, theme.cpuColor);
 
         p.drawText(r.left(), r.top() + 46,
                    QStringLiteral("Memoria: %1 %").arg(qRound(m_mem * 100)));
-        drawBar(p, r.adjusted(0, 50, 0, 50), m_mem, QColor(0x33, 0x9d, 0xd6));
+        drawBar(p, r.adjusted(0, 50, 0, 50), m_mem, theme.memColor);
     }
 
     double m_cpu = 0.0;
@@ -2210,13 +2737,10 @@ private:
 
         quint64 rx = 0;
         quint64 tx = 0;
-        bool first = true;
-        while (!f.atEnd()) {
-            const QByteArray line = f.readLine();
-            if (first) {          // cabecera
-                first = false;
-                continue;
-            }
+        // Igual que en /proc/meminfo: tamaño 0 → no sirve atEnd()
+        const QList<QByteArray> lines = f.readAll().split('\n');
+        for (int i = 1; i < lines.size(); ++i) {   // la línea 0 es la cabecera
+            const QByteArray &line = lines.at(i);
             const int colon = line.indexOf(':');
             if (colon < 0)
                 continue;
@@ -2251,11 +2775,11 @@ private:
 
     void paintContent(QPainter &p, const QRect &r) const override
     {
-        p.setPen(QColor(0x66, 0xd9, 0xe8));
+        p.setPen(Theme::get().netColor);
         p.drawText(QRect(r.left(), r.top(), r.width(), 20),
                    Qt::AlignLeft | Qt::AlignVCenter,
                    QStringLiteral("Bajada: %1").arg(humanRate(m_down)));
-        p.setPen(QColor(255, 255, 255));
+        p.setPen(Theme::get().panelText);
         p.drawText(QRect(r.left(), r.top() + 24, r.width(), 20),
                    Qt::AlignLeft | Qt::AlignVCenter,
                    QStringLiteral("Subida: %1").arg(humanRate(m_up)));
@@ -2320,13 +2844,13 @@ private:
             const double ratio = total > 0
                 ? double(total - free) / double(total) : 0.0;
 
-            p.setPen(QColor(255, 255, 255));
+            p.setPen(Theme::get().panelText);
             p.drawText(QRect(r.left(), r.top() + y, r.width(), 16),
                        Qt::AlignLeft | Qt::AlignVCenter,
                        QStringLiteral("%1   %2 % ocupado")
                            .arg(path, QString::number(qRound(ratio * 100))));
             drawBar(p, QRect(r.left(), r.top() + y + 16, r.width(), 8),
-                    ratio, QColor(0xe6, 0x7e, 0x22));
+                    ratio, Theme::get().diskColor);
             y += 30;
             ++shown;
         }
@@ -2634,6 +3158,52 @@ private:
     QCheckBox *m_widgetDisk    = nullptr;
 };
 
+// Hoja de estilo de la barra lateral del diálogo de Configuración.
+// Sin un QSS global conserva el aspecto oscuro original; con un tema activo
+// usa los colores de la paleta para acoplarse a él automáticamente.
+static QString configSidebarStyleSheet()
+{
+    if (qApp->styleSheet().isEmpty())
+        return QStringLiteral(R"(
+            QListWidget#configSidebar {
+                background: #22272e;
+                border: none;
+                outline: none;
+                padding: 6px;
+            }
+            QListWidget#configSidebar::item {
+                color: #eceff4;
+                padding: 8px;
+                border-radius: 6px;
+            }
+            QListWidget#configSidebar::item:selected {
+                background: #3d4750;
+            }
+            QListWidget#configSidebar::item:hover {
+                background: #2f3840;
+            }
+        )");
+
+    return QStringLiteral(R"(
+        QListWidget#configSidebar {
+            border: none;
+            outline: none;
+            padding: 6px;
+        }
+        QListWidget#configSidebar::item {
+            padding: 8px;
+            border-radius: 6px;
+        }
+        QListWidget#configSidebar::item:selected {
+            background: palette(highlight);
+            color: palette(highlighted-text);
+        }
+        QListWidget#configSidebar::item:hover {
+            background: palette(alternate-base);
+        }
+    )");
+}
+
 SettingsDialog::SettingsDialog(const QString &wallpaperFilePath, QWidget *parent)
     : QDialog(parent)
     , m_wallpaperFilePath(wallpaperFilePath)
@@ -2655,25 +3225,7 @@ SettingsDialog::SettingsDialog(const QString &wallpaperFilePath, QWidget *parent
     m_sidebar->setObjectName(QStringLiteral("configSidebar"));
     m_sidebar->setFixedWidth(176);
     m_sidebar->setIconSize(QSize(32, 32));
-    m_sidebar->setStyleSheet(QStringLiteral(R"(
-        QListWidget#configSidebar {
-            background: #22272e;
-            border: none;
-            outline: none;
-            padding: 6px;
-        }
-        QListWidget#configSidebar::item {
-            color: #eceff4;
-            padding: 8px;
-            border-radius: 6px;
-        }
-        QListWidget#configSidebar::item:selected {
-            background: #3d4750;
-        }
-        QListWidget#configSidebar::item:hover {
-            background: #2f3840;
-        }
-    )"));
+    m_sidebar->setStyleSheet(configSidebarStyleSheet());
 
     const auto addSection = [this](const char *icon, const QString &text) {
         auto *item = new QListWidgetItem(configIcon(icon), text);
@@ -3031,8 +3583,11 @@ void SettingsDialog::restoreAllDefaults()
                             ? systemIconThemeName()
                             : m_settings.iconTheme);
     qApp->setStyleSheet(QString());
-    for (DesktopView *view : allDesktopViews())
+    Theme::invalidate();
+    for (DesktopView *view : allDesktopViews()) {
         view->applySettings(m_settings);
+        view->repaint();
+    }
 
     // Refleja los valores de fábrica en el diálogo
     m_desktopDirEdit->setText(m_settings.desktopDir);
@@ -3092,10 +3647,13 @@ void SettingsDialog::accept()
     } else {
         qApp->setStyleSheet(QString());
     }
+    Theme::invalidate();   // los paintEvent leen el tema nuevo
 
     globalSettings() = m_settings;
-    for (DesktopView *view : allDesktopViews())
+    for (DesktopView *view : allDesktopViews()) {
         view->applySettings(m_settings);
+        view->repaint();   // aplica de inmediato el tema a iconos y widgets
+    }
 
     applyDisplayChanges();
 
@@ -3187,11 +3745,15 @@ int main(int argc, char *argv[])
             qssLoaded = true;
         }
     } else {
-        // preferencia guardada en Configuración > rutas por defecto
+        // preferencia guardada en Configuración > tema por defecto (junto al
+        // binario, p. ej. en el paquete portátil) > instalaciones del sistema
         QStringList candidates;
         if (!settings.qssFile.isEmpty())
             candidates << settings.qssFile;
-        candidates << QStringLiteral("/usr/share/stellarbox/stellarbox.qss")
+        const QString appDir = QCoreApplication::applicationDirPath();
+        candidates << appDir + QStringLiteral("/stellarbox.qss")
+                   << appDir + QStringLiteral("/../share/stellarbox/stellarbox.qss")
+                   << QStringLiteral("/usr/share/stellarbox/stellarbox.qss")
                    << QStringLiteral("/usr/local/share/stellarbox/stellarbox.qss");
         for (const QString &candidate : candidates) {
             QFile f(candidate);
@@ -3204,6 +3766,9 @@ int main(int argc, char *argv[])
     }
     if (!qssLoaded)
         std::fputs("stellarbox: no se pudo cargar QSS\n", stderr);
+
+    // El pintado propio (iconos y widgets) deriva sus colores del QSS activo
+    Theme::invalidate();
 
     // --- tema de iconos (preferencia guardada > tema del sistema) -----------
     // Si el usuario no eligió uno en Configuración, adoptamos el tema de

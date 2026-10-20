@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Stellarbox Windesktop
+Comment=Escritorio gráfico con fondo de pantalla e iconos
+Comment[es]=Escritorio gráfico con fondo de pantalla e iconos
+Exec=stellarbox-windesktop
+TryExec=stellarbox-windesktop
+Icon=stellarbox-windesktop
+Terminal=false
+StartupNotify=false
+Categories=Utility;DesktopSettings;
+Keywords=desktop;wallpaper;icons;escritorio;fondo;iconos;
+X-AppImage-Name=stellarbox-windesktop
+X-AppImage-Version=0.2.0

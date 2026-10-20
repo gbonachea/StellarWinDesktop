@@ -1,0 +1,159 @@
+/* Tema por defecto de Stellarbox Windesktop.
+ *
+ * El bloque @stellarbox sólo afecta a las zonas que se pintan con QPainter
+ * (iconos del escritorio y widgets del reloj/sistema/red/discos), que el QSS
+ * no puede alcanzar. Los colores de las barras (cpuColor, memColor…) se dejan
+ * sin definir para conservar sus tonos originales. */
+
+/* @stellarbox {
+     "selectionColor":  "#93ba84",
+     "panelColor":      "#b3262638",
+     "panelTitleColor": "#bec8d2",
+     "iconRadius":      8,
+     "panelRadius":     12,
+     "barRadius":       4,
+     "panelBlur":       14 } */
+
+* {
+    outline: 0;
+}
+
+QToolTip {
+    background: #262638;
+    color: #e6e6f0;
+    border: 1px solid #4a4a60;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+
+QLineEdit {
+    background: #1d1d2a;
+    border: 1px solid #4a4a60;
+    border-radius: 9px;
+    padding: 6px 10px;
+    color: #e6e6f0;
+    font-size: 13px;
+    selection-background-color: #93ba84;
+    selection-color: #0c0c12;
+}
+
+QLineEdit:focus {
+    border-color: #93ba84;
+}
+
+QLineEdit[echoMode="2"] {
+    font-family: "DejaVu Sans Mono";
+    font-style: italic;
+}
+
+QPushButton {
+    background: #2e2e44;
+    border: 1px solid #4a4a60;
+    border-radius: 9px;
+    padding: 7px 14px;
+    color: #e6e6f0;
+    font-size: 12px;
+}
+
+QPushButton:hover {
+    background: #3a3a52;
+    border-color: #93ba84;
+}
+
+QPushButton:pressed {
+    background: #262638;
+}
+
+QPushButton:disabled {
+    color: #6f6f8a;
+    background: #1d1d2a;
+}
+
+QListWidget,
+QListView,
+QTreeWidget {
+    background: #262638;
+    border: 1px solid #4a4a60;
+    border-radius: 10px;
+    color: #e6e6f0;
+    outline: 0;
+}
+
+QListWidget::item,
+QListView::item {
+    padding: 6px 10px;
+    border-radius: 6px;
+    margin: 1px;
+}
+
+QListWidget::item:hover,
+QListView::item:hover {
+    background: #33334a;
+}
+
+QListWidget::item:selected,
+QListView::item:selected {
+    background: #3a3a5c;
+    color: #f3c4c4;
+}
+
+QScrollBar:vertical {
+    background: #1d1d2a;
+    width: 10px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #4a4a60;
+    border-radius: 5px;
+    min-height: 30px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #5a5a72;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
+QMenu {
+    background: #262638;
+    border: 1px solid #4a4a60;
+    border-radius: 10px;
+}
+
+QMenu::item {
+    padding: 8px 24px;
+    border-radius: 6px;
+    color: #e6e6f0;
+}
+
+QMenu::item:selected {
+    background: #3a3a5c;
+    color: #f3c4c4;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #4a4a60;
+    margin: 6px 12px;
+}
+
+QHeaderView::section {
+    background: #2e2e44;
+    color: #e6e6f0;
+    border: 1px solid #4a4a60;
+    padding: 6px;
+}
+
+QLabel {
+    color: #e6e6f0;
+    background: transparent;
+}
